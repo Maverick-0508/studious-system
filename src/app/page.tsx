@@ -314,14 +314,20 @@ export default function Home() {
   );
 
   const permissions = activeUser ? ROLE_PERMISSIONS[activeUser.role] : ROLE_PERMISSIONS.dispatcher;
-  const liveVehicles = activeDashboard ? tenantVehicles[activeDashboard.tenant.id] ?? activeDashboard.vehicles : [];
+  const liveVehicles = useMemo(
+    () => (activeDashboard ? tenantVehicles[activeDashboard.tenant.id] ?? activeDashboard.vehicles : []),
+    [activeDashboard, tenantVehicles],
+  );
   const playbackFrame = activeDashboard?.playbackFrames[timelineIndex] ?? null;
   const displayVehicles = playbackMode && playbackFrame ? playbackFrame.vehicles : liveVehicles;
-  const plannedStations =
-    showScenario && permissions.canPlan && activeDashboard
-      ? [...activeDashboard.stations, activeDashboard.candidateStation]
-      : activeDashboard?.stations ?? [];
-  const routeList = activeDashboard?.routes ?? [];
+  const plannedStations = useMemo(
+    () =>
+      showScenario && permissions.canPlan && activeDashboard
+        ? [...activeDashboard.stations, activeDashboard.candidateStation]
+        : activeDashboard?.stations ?? [],
+    [activeDashboard, permissions.canPlan, showScenario],
+  );
+  const routeList = useMemo(() => activeDashboard?.routes ?? [], [activeDashboard]);
   const alerts = useMemo(
     () => createOperationalAlerts(liveVehicles, plannedStations, routeList),
     [liveVehicles, plannedStations, routeList],

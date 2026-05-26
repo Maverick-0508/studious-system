@@ -1,19 +1,43 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { jsPDF } from "jspdf";
+import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
   advanceFleetState,
+  buildStationScenarioMetrics,
   calculateCarbonMetrics,
-  createInitialFleetState,
+  createDispatchPlan,
+  createOperationalAlerts,
   getNearestCompatibleStation,
-  type Vehicle,
-} from "@/lib/mockFleet";
+} from "@/lib/fleetEngine";
+import type {
+  DashboardPreset,
+  DateRange,
+  FleetDatabase,
+  Role,
+  Vehicle,
+  VehicleStatus,
+} from "@/lib/fleetTypes";
 
-const emissionBars = [
-  { label: "Diesel fleet", valueKey: "diesel" as const },
-  { label: "EV fleet", valueKey: "grid" as const },
-  { label: "Saved", valueKey: "saved" as const },
-];
+const ROLE_LABELS: Record<Role, string> = {
+  dispatcher: "Dispatcher",
+  ops_manager: "Ops manager",
+  admin: "Admin",
+  client_view: "Client view",
+};
+
+const RANGE_POINTS: Record<DateRange, number> = {
+  "24h": 1,
+  "7d": 7,
+  "30d": 30,
+};
+
+const ROLE_PERMISSIONS: Record<Role, { canExport: boolean; canPlan: boolean; canSavePreset: boolean }> = {
+  dispatcher: { canExport: false, canPlan: false, canSavePreset: true },
+  ops_manager: { canExport: true, canPlan: true, canSavePreset: true },
+  admin: { canExport: true, canPlan: true, canSavePreset: true },
+  client_view: { canExport: true, canPlan: false, canSavePreset: false },
+};
 
 function formatNumber(value: number, digits = 0): string {
   return new Intl.NumberFormat("en-US", {
@@ -30,8 +54,17 @@ function formatCurrency(value: number): string {
   }).format(value);
 }
 
-function statusTone(status: Vehicle["status"]): string {
-  if (status === "Detouring to swap" || status === "Detouring to charger") {
+function formatDateTime(value: string): string {
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
+function statusTone(status: VehicleStatus): string {
+  if (status === "Detouring to swap" || status === "Detouring to charger" || status === "Delayed") {
     return "status-warning";
   }
 
@@ -42,8 +75,20 @@ function statusTone(status: Vehicle["status"]): string {
   return "status-neutral";
 }
 
-function downloadTextFile(filename: string, content: string): void {
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+function severityTone(severity: "high" | "medium" | "low"): string {
+  if (severity === "high") {
+    return "pill-danger";
+  }
+
+  if (severity === "medium") {
+    return "pill-warning";
+  }
+
+  return "pill-neutral";
+}
+
+function downloadTextFile(filename: string, content: string, type = "text/plain;charset=utf-8"): void {
+  const blob = new Blob([content], { type });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
@@ -52,20 +97,17 @@ function downloadTextFile(filename: string, content: string): void {
   URL.revokeObjectURL(url);
 }
 
-function MeterBar({ value, tone }: { value: number; tone: "battery" | "diesel" | "grid" | "saved" }) {
-  const fillClass =
-    tone === "battery"
-      ? "meter-fill meter-battery"
-      : tone === "diesel"
-        ? "meter-fill meter-diesel"
-        : tone === "grid"
-          ? "meter-fill meter-grid"
-          : "meter-fill meter-saved";
-
+function MeterBar({
+  value,
+  tone,
+}: {
+  value: number;
+  tone: "battery" | "diesel" | "grid" | "saved" | "warning";
+}) {
   return (
     <svg className="meter" viewBox="0 0 100 10" preserveAspectRatio="none" aria-hidden="true">
       <rect className="meter-track" x="0" y="0" width="100" height="10" rx="5" />
-      <rect className={fillClass} x="0" y="0" width={Math.max(6, Math.min(100, value))} height="10" rx="5" />
+      <rect className={`meter-fill meter-${tone}`} x="0" y="0" width={Math.max(5, Math.min(100, value))} height="10" rx="5" />
     </svg>
   );
 }
@@ -87,21 +129,41 @@ function ThemeIcon({ theme }: { theme: "dark" | "light" }) {
   );
 }
 
+function handleActionKey(event: KeyboardEvent<SVGGElement>, callback: () => void): void {
+  if (event.key === "Enter" || event.key === " ") {
+    event.preventDefault();
+    callback();
+  }
+}
+
 export default function Home() {
-  const [fleetState, setFleetState] = useState(() => createInitialFleetState());
-  const [selectedVehicleId, setSelectedVehicleId] = useState(fleetState.vehicles[0].id);
+  const [database, setDatabase] = useState<FleetDatabase | null>(null);
+  const [tenantVehicles, setTenantVehicles] = useState<Record<string, Vehicle[]>>({});
+  const [selectedTenantId, setSelectedTenantId] = useState("");
+  const [selectedUserId, setSelectedUserId] = useState("");
+  const [selectedVehicleId, setSelectedVehicleId] = useState("");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<VehicleStatus | "all">("all");
+  const [lowBatteryOnly, setLowBatteryOnly] = useState(false);
+  const [dateRange, setDateRange] = useState<DateRange>("7d");
+  const [playbackMode, setPlaybackMode] = useState(false);
+  const [timelineIndex, setTimelineIndex] = useState(0);
+  const [timelinePlaying, setTimelinePlaying] = useState(false);
+  const [showScenario, setShowScenario] = useState(false);
+  const [presetName, setPresetName] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState("Waiting for live data");
 
   useEffect(() => {
     const savedTheme = window.localStorage.getItem("ecofleet-theme");
-
     if (savedTheme === "light" || savedTheme === "dark") {
       setTheme(savedTheme);
       return;
     }
 
-    const prefersLight = window.matchMedia("(prefers-color-scheme: light)").matches;
-    setTheme(prefersLight ? "light" : "dark");
+    setTheme(window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark");
   }, []);
 
   useEffect(() => {
@@ -111,24 +173,255 @@ export default function Home() {
   }, [theme]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      setFleetState((currentState) => advanceFleetState(currentState));
-    }, 1800);
+    let active = true;
 
-    return () => window.clearInterval(timer);
+    async function loadData() {
+      try {
+        setIsLoading(true);
+        setError(null);
+        const response = await fetch("/api/fleet", { cache: "no-store" });
+
+        if (!response.ok) {
+          throw new Error("Dashboard data could not be loaded.");
+        }
+
+        const nextDatabase = (await response.json()) as FleetDatabase;
+
+        if (!active) {
+          return;
+        }
+
+        setDatabase(nextDatabase);
+        setTenantVehicles(
+          Object.fromEntries(nextDatabase.dashboards.map((dashboard) => [dashboard.tenant.id, dashboard.vehicles])),
+        );
+
+        const savedTenantId = window.localStorage.getItem("ecofleet-tenant");
+        const fallbackTenantId = nextDatabase.dashboards[0]?.tenant.id ?? "";
+        const nextTenantId =
+          savedTenantId && nextDatabase.dashboards.some((dashboard) => dashboard.tenant.id === savedTenantId)
+            ? savedTenantId
+            : fallbackTenantId;
+        const savedUserId = window.localStorage.getItem("ecofleet-user");
+        const usersForTenant = nextDatabase.users.filter((user) => user.tenantId === nextTenantId);
+        const nextUserId = usersForTenant.some((user) => user.id === savedUserId) ? savedUserId ?? "" : usersForTenant[0]?.id ?? "";
+
+        setSelectedTenantId(nextTenantId);
+        setSelectedUserId(nextUserId);
+        setSelectedVehicleId(nextDatabase.dashboards[0]?.vehicles[0]?.id ?? "");
+        setSearch(window.localStorage.getItem("ecofleet-search") ?? "");
+      } catch (loadError) {
+        if (active) {
+          setError(loadError instanceof Error ? loadError.message : "Unexpected dashboard error.");
+        }
+      } finally {
+        if (active) {
+          setIsLoading(false);
+        }
+      }
+    }
+
+    void loadData();
+
+    return () => {
+      active = false;
+    };
   }, []);
 
-  const carbonMetrics = useMemo(() => calculateCarbonMetrics(fleetState.vehicles), [fleetState.vehicles]);
-  const selectedVehicle = fleetState.vehicles.find((vehicle) => vehicle.id === selectedVehicleId) ?? fleetState.vehicles[0];
-  const focusStation = getNearestCompatibleStation(selectedVehicle, fleetState.stations);
-  const lowBatteryVehicles = fleetState.vehicles.filter((vehicle) => vehicle.batterySoc <= 20);
-  const topDispatches = [...fleetState.vehicles].sort((left, right) => right.batterySoc - left.batterySoc);
-  const emissionChartMax = Math.max(carbonMetrics.dieselEmissionsKg, carbonMetrics.gridEmissionsKg);
-  const focusTransform = `translate(${Math.max(-28, 50 - selectedVehicle.x)} ${Math.max(-28, 50 - selectedVehicle.y)}) scale(1.08)`;
+  useEffect(() => {
+    if (!selectedTenantId) {
+      return;
+    }
 
-  const exportReport = () => {
+    window.localStorage.setItem("ecofleet-tenant", selectedTenantId);
+  }, [selectedTenantId]);
+
+  useEffect(() => {
+    if (!selectedUserId) {
+      return;
+    }
+
+    window.localStorage.setItem("ecofleet-user", selectedUserId);
+  }, [selectedUserId]);
+
+  useEffect(() => {
+    window.localStorage.setItem("ecofleet-search", search);
+  }, [search]);
+
+  useEffect(() => {
+    if (!database) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setTenantVehicles((current) =>
+        Object.fromEntries(
+          database.dashboards.map((dashboard) => {
+            const existingVehicles = current[dashboard.tenant.id] ?? dashboard.vehicles;
+            return [dashboard.tenant.id, advanceFleetState(existingVehicles, dashboard.stations)];
+          }),
+        ),
+      );
+      setLastUpdated(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }));
+    }, 2200);
+
+    return () => window.clearInterval(timer);
+  }, [database]);
+
+  useEffect(() => {
+    if (!database || !selectedTenantId) {
+      return;
+    }
+
+    const tenantUsers = database.users.filter((user) => user.tenantId === selectedTenantId);
+
+    if (!tenantUsers.some((user) => user.id === selectedUserId)) {
+      setSelectedUserId(tenantUsers[0]?.id ?? "");
+    }
+  }, [database, selectedTenantId, selectedUserId]);
+
+  useEffect(() => {
+    if (!playbackMode || !timelinePlaying || !database) {
+      return;
+    }
+
+    const activeDashboard = database.dashboards.find((dashboard) => dashboard.tenant.id === selectedTenantId);
+
+    if (!activeDashboard) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setTimelineIndex((currentIndex) => (currentIndex + 1) % activeDashboard.playbackFrames.length);
+    }, 1200);
+
+    return () => window.clearInterval(timer);
+  }, [database, playbackMode, selectedTenantId, timelinePlaying]);
+
+  const activeDashboard = useMemo(
+    () => database?.dashboards.find((dashboard) => dashboard.tenant.id === selectedTenantId) ?? null,
+    [database, selectedTenantId],
+  );
+
+  const usersForTenant = useMemo(
+    () => database?.users.filter((user) => user.tenantId === selectedTenantId) ?? [],
+    [database, selectedTenantId],
+  );
+
+  const activeUser = useMemo(
+    () => usersForTenant.find((user) => user.id === selectedUserId) ?? usersForTenant[0] ?? null,
+    [selectedUserId, usersForTenant],
+  );
+
+  const permissions = activeUser ? ROLE_PERMISSIONS[activeUser.role] : ROLE_PERMISSIONS.dispatcher;
+  const liveVehicles = activeDashboard ? tenantVehicles[activeDashboard.tenant.id] ?? activeDashboard.vehicles : [];
+  const playbackFrame = activeDashboard?.playbackFrames[timelineIndex] ?? null;
+  const displayVehicles = playbackMode && playbackFrame ? playbackFrame.vehicles : liveVehicles;
+  const plannedStations =
+    showScenario && permissions.canPlan && activeDashboard
+      ? [...activeDashboard.stations, activeDashboard.candidateStation]
+      : activeDashboard?.stations ?? [];
+  const routeList = activeDashboard?.routes ?? [];
+  const alerts = useMemo(
+    () => createOperationalAlerts(liveVehicles, plannedStations, routeList),
+    [liveVehicles, plannedStations, routeList],
+  );
+  const history = activeDashboard?.history ?? [];
+  const visibleHistory = history.slice(-RANGE_POINTS[dateRange]);
+
+  const filteredVehicles = useMemo(() => {
+    return displayVehicles.filter((vehicle) => {
+      const matchesSearch =
+        search.trim().length === 0 ||
+        `${vehicle.name} ${vehicle.model}`.toLowerCase().includes(search.trim().toLowerCase());
+      const matchesStatus = statusFilter === "all" || vehicle.status === statusFilter;
+      const matchesBattery = !lowBatteryOnly || vehicle.batterySoc <= 25;
+      return matchesSearch && matchesStatus && matchesBattery;
+    });
+  }, [displayVehicles, lowBatteryOnly, search, statusFilter]);
+
+  useEffect(() => {
+    if (!filteredVehicles.length) {
+      return;
+    }
+
+    if (!filteredVehicles.some((vehicle) => vehicle.id === selectedVehicleId)) {
+      setSelectedVehicleId(filteredVehicles[0].id);
+    }
+  }, [filteredVehicles, selectedVehicleId]);
+
+  const selectedVehicle = filteredVehicles.find((vehicle) => vehicle.id === selectedVehicleId) ?? filteredVehicles[0] ?? displayVehicles[0];
+  const focusStation = selectedVehicle ? getNearestCompatibleStation(selectedVehicle, plannedStations) : null;
+  const carbonMetrics = useMemo(() => calculateCarbonMetrics(liveVehicles), [liveVehicles]);
+  const playbackMetrics = useMemo(() => calculateCarbonMetrics(displayVehicles), [displayVehicles]);
+  const stationMetrics = useMemo(() => buildStationScenarioMetrics(plannedStations), [plannedStations]);
+  const dispatchPlan = useMemo(
+    () => createDispatchPlan(liveVehicles, routeList, plannedStations).sort((left, right) => right.score - left.score),
+    [liveVehicles, plannedStations, routeList],
+  );
+
+  const vehicleBreakdown = useMemo(
+    () =>
+      liveVehicles.map((vehicle) => ({
+        id: vehicle.id,
+        name: vehicle.name,
+        emissionsSavedKg: vehicle.mileage * 0.64,
+        gridFootprintKg: vehicle.mileage * 0.18,
+        costSaved: (vehicle.mileage / 8.8) * 4.45 - vehicle.energyUsedKwh * 0.16,
+      })),
+    [liveVehicles],
+  );
+
+  const routeBreakdown = useMemo(
+    () =>
+      routeList.map((route) => {
+        const assignedVehicle = liveVehicles.find((vehicle) => vehicle.id === route.vehicleId);
+        return {
+          id: route.id,
+          name: route.name,
+          priority: route.priority,
+          emissionsSavedKg: (assignedVehicle?.mileage ?? route.estimatedMiles) * 0.64,
+          delayMinutes: route.trafficDelayMinutes,
+        };
+      }),
+    [liveVehicles, routeList],
+  );
+
+  const emissionsTrend =
+    visibleHistory.length > 1
+      ? visibleHistory[visibleHistory.length - 1].emissionsSavedKg - visibleHistory[0].emissionsSavedKg
+      : carbonMetrics.emissionsSavedKg;
+  const onTimeTrend =
+    visibleHistory.length > 1 ? visibleHistory[visibleHistory.length - 1].onTimeRate - visibleHistory[0].onTimeRate : 0;
+
+  async function retryLoad(): Promise<void> {
+    setDatabase(null);
+    setTenantVehicles({});
+    setSelectedTenantId("");
+    setSelectedUserId("");
+    setSelectedVehicleId("");
+    setError(null);
+    setIsLoading(true);
+
+    const response = await fetch("/api/fleet", { cache: "no-store" });
+    const nextDatabase = (await response.json()) as FleetDatabase;
+    setDatabase(nextDatabase);
+    setTenantVehicles(Object.fromEntries(nextDatabase.dashboards.map((dashboard) => [dashboard.tenant.id, dashboard.vehicles])));
+    setSelectedTenantId(nextDatabase.dashboards[0]?.tenant.id ?? "");
+    setSelectedUserId(nextDatabase.users[0]?.id ?? "");
+    setSelectedVehicleId(nextDatabase.dashboards[0]?.vehicles[0]?.id ?? "");
+    setIsLoading(false);
+  }
+
+  function exportCsv(): void {
+    if (!permissions.canExport) {
+      return;
+    }
+
     const lines = [
       ["Metric", "Value"],
+      ["Tenant", activeDashboard?.tenant.name ?? ""],
+      ["Role", activeUser ? ROLE_LABELS[activeUser.role] : ""],
       ["Total miles", formatNumber(carbonMetrics.totalMiles, 1)],
       ["EV energy used (kWh)", formatNumber(carbonMetrics.totalEnergyKwh, 1)],
       ["Diesel emissions (kg CO2)", formatNumber(carbonMetrics.dieselEmissionsKg, 1)],
@@ -139,28 +432,131 @@ export default function Home() {
       .map((row) => row.join(","))
       .join("\n");
 
-    downloadTextFile("ecofleet-carbon-dashboard.csv", lines);
-  };
+    downloadTextFile("ecofleet-carbon-report.csv", lines, "text/csv;charset=utf-8");
+  }
+
+  function exportPdf(): void {
+    if (!permissions.canExport) {
+      return;
+    }
+
+    const pdf = new jsPDF();
+    pdf.setFontSize(18);
+    pdf.text("EcoFleet ESG report", 16, 18);
+    pdf.setFontSize(11);
+    pdf.text(`Tenant: ${activeDashboard?.tenant.name ?? "Unknown"}`, 16, 28);
+    pdf.text(`Generated: ${new Date().toLocaleString()}`, 16, 35);
+    pdf.text(`Emissions saved: ${formatNumber(carbonMetrics.emissionsSavedKg, 1)} kg CO2`, 16, 46);
+    pdf.text(`Cost saved: ${formatCurrency(carbonMetrics.costSaved)}`, 16, 53);
+    pdf.text(`On-time delivery trend: ${formatNumber(onTimeTrend, 1)} pts`, 16, 60);
+    pdf.text("Per-vehicle breakdown", 16, 74);
+
+    let y = 84;
+
+    vehicleBreakdown.slice(0, 6).forEach((vehicle) => {
+      pdf.text(
+        `${vehicle.name}: ${formatNumber(vehicle.emissionsSavedKg, 1)} kg saved / ${formatCurrency(vehicle.costSaved)} avoided`,
+        18,
+        y,
+      );
+      y += 8;
+    });
+
+    pdf.save("ecofleet-esg-report.pdf");
+  }
+
+  async function savePreset(): Promise<void> {
+    if (!activeDashboard || !permissions.canSavePreset || !presetName.trim()) {
+      return;
+    }
+
+    const preset: DashboardPreset = {
+      id: `preset-${Date.now()}`,
+      name: presetName.trim(),
+      city: activeDashboard.tenant.city,
+      search,
+      statusFilter,
+      lowBatteryOnly,
+      dateRange,
+    };
+
+    const response = await fetch("/api/fleet", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        action: "save-preset",
+        tenantId: activeDashboard.tenant.id,
+        preset,
+      }),
+    });
+
+    if (!response.ok) {
+      return;
+    }
+
+    const nextDatabase = (await response.json()) as FleetDatabase;
+    setDatabase(nextDatabase);
+    setPresetName("");
+  }
+
+  function applyPreset(preset: DashboardPreset): void {
+    setSearch(preset.search);
+    setStatusFilter(preset.statusFilter);
+    setLowBatteryOnly(preset.lowBatteryOnly);
+    setDateRange(preset.dateRange);
+  }
+
+  if (isLoading) {
+    return (
+      <main className="shell loading-shell">
+        <section className="hero-panel loading-panel">
+          <p className="eyebrow">EcoFleet OS</p>
+          <h1>Loading fleet intelligence…</h1>
+          <p className="hero-copy">Connecting to the local API, telemetry history, alerts, presets, and station planning data.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (error || !activeDashboard || !activeUser) {
+    return (
+      <main className="shell loading-shell">
+        <section className="hero-panel loading-panel">
+          <p className="eyebrow">EcoFleet OS</p>
+          <h1>Dashboard unavailable</h1>
+          <p className="hero-copy">{error ?? "Tenant data could not be resolved."}</p>
+          <button type="button" className="primary-button" onClick={() => void retryLoad()}>
+            Retry
+          </button>
+        </section>
+      </main>
+    );
+  }
 
   return (
     <main className="shell">
       <section className="hero-panel">
         <div>
           <p className="eyebrow">EcoFleet OS</p>
-          <h1>One platform for EV fleet operations, charging intelligence, and ESG proof.</h1>
+          <h1>Live fleet ops, role-aware dispatching, and auditable ESG reporting.</h1>
           <p className="hero-copy">
-            Dispatch fifty deliveries, monitor battery health in real time, intercept low-charge vans with the nearest
-            compatible swap station, and export a carbon report clients can actually trust.
+            This upgrade adds a local API/data layer, tenant-aware access, dispatch recommendations, alert routing, station scenario
+            planning, history filters, preset storage, and timeline playback.
           </p>
         </div>
 
         <div className="hero-actions">
-          <button type="button" className="primary-button" onClick={exportReport}>
-            Export carbon report
+          <button type="button" className="primary-button" onClick={exportCsv} disabled={!permissions.canExport}>
+            Export CSV
+          </button>
+          <button type="button" className="secondary-button" onClick={exportPdf} disabled={!permissions.canExport}>
+            Export PDF
           </button>
           <div className="hero-meta">
             <span>Live sync</span>
-            <strong>{fleetState.lastUpdated}</strong>
+            <strong>{lastUpdated}</strong>
           </div>
         </div>
       </section>
@@ -170,31 +566,170 @@ export default function Home() {
         className="theme-fab"
         onClick={() => setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))}
         aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
-        title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
       >
         <ThemeIcon theme={theme} />
       </button>
 
+      <section className="toolbar-grid">
+        <article className="panel control-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Authentication + roles</p>
+              <h2>Tenant access</h2>
+            </div>
+            <span className="badge">{ROLE_LABELS[activeUser.role]}</span>
+          </div>
+          <label className="field">
+            <span>Tenant</span>
+            <select value={selectedTenantId} onChange={(event) => setSelectedTenantId(event.target.value)}>
+              {database.dashboards.map((dashboard) => (
+                <option key={dashboard.tenant.id} value={dashboard.tenant.id}>
+                  {dashboard.tenant.name} · {dashboard.tenant.city}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="field">
+            <span>Signed in as</span>
+            <select value={activeUser.id} onChange={(event) => setSelectedUserId(event.target.value)}>
+              {usersForTenant.map((user) => (
+                <option key={user.id} value={user.id}>
+                  {user.name} · {ROLE_LABELS[user.role]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className="tenant-meta">
+            <div>
+              <span>City</span>
+              <strong>{activeDashboard.tenant.city}</strong>
+            </div>
+            <div>
+              <span>Timezone</span>
+              <strong>{activeDashboard.tenant.timezone}</strong>
+            </div>
+            <div>
+              <span>Carbon target</span>
+              <strong>{activeDashboard.tenant.carbonTargetPercent}% reduction</strong>
+            </div>
+          </div>
+        </article>
+
+        <article className="panel control-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Search + presets</p>
+              <h2>Operator filters</h2>
+            </div>
+            <span className="badge">{filteredVehicles.length} matches</span>
+          </div>
+          <label className="field">
+            <span>Search vehicles</span>
+            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Atlas, E-van, E-cargo…" />
+          </label>
+          <div className="field-row">
+            <label className="field">
+              <span>Status</span>
+              <select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as VehicleStatus | "all")}>
+                <option value="all">All</option>
+                <option value="En route">En route</option>
+                <option value="Delayed">Delayed</option>
+                <option value="Detouring to swap">Detouring to swap</option>
+                <option value="Detouring to charger">Detouring to charger</option>
+                <option value="Swapping battery">Swapping battery</option>
+                <option value="Fast charging">Fast charging</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>Date range</span>
+              <select value={dateRange} onChange={(event) => setDateRange(event.target.value as DateRange)}>
+                <option value="24h">24 hours</option>
+                <option value="7d">7 days</option>
+                <option value="30d">30 days</option>
+              </select>
+            </label>
+          </div>
+          <label className="checkbox-row">
+            <input type="checkbox" checked={lowBatteryOnly} onChange={(event) => setLowBatteryOnly(event.target.checked)} />
+            <span>Only show vehicles at 25% SoC or lower</span>
+          </label>
+          <div className="field-row">
+            <label className="field">
+              <span>Save preset</span>
+              <input
+                value={presetName}
+                onChange={(event) => setPresetName(event.target.value)}
+                placeholder={permissions.canSavePreset ? "Morning dispatch review" : "Preset saving unavailable"}
+                disabled={!permissions.canSavePreset}
+              />
+            </label>
+            <button type="button" className="secondary-button" onClick={() => void savePreset()} disabled={!permissions.canSavePreset}>
+              Save
+            </button>
+          </div>
+          <div className="preset-list">
+            {activeDashboard.presets.map((preset) => (
+              <button key={preset.id} type="button" className="preset-chip" onClick={() => applyPreset(preset)}>
+                {preset.name}
+              </button>
+            ))}
+          </div>
+        </article>
+
+        <article className="panel control-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Notifications</p>
+              <h2>Alert center</h2>
+            </div>
+            <span className="badge badge-strong">{alerts.length} active</span>
+          </div>
+          <div className="alert-list">
+            {alerts.slice(0, 3).map((alert) => (
+              <div key={alert.id} className="alert-card">
+                <div className="alert-top">
+                  <strong>{alert.title}</strong>
+                  <span className={`pill ${severityTone(alert.severity)}`}>{alert.severity}</span>
+                </div>
+                <p>{alert.message}</p>
+                <small>{alert.channels.join(" · ")}</small>
+              </div>
+            ))}
+          </div>
+          <div className="endpoint-list">
+            {activeDashboard.notificationEndpoints.map((endpoint) => (
+              <div key={endpoint.id} className="endpoint-row">
+                <div>
+                  <strong>{endpoint.name}</strong>
+                  <span>{endpoint.channel}</span>
+                </div>
+                <span>{endpoint.enabled ? endpoint.target : "Disabled"}</span>
+              </div>
+            ))}
+          </div>
+        </article>
+      </section>
+
       <section className="stat-grid">
         <article className="stat-card accent-cyan">
           <span>Active vehicles</span>
-          <strong>{fleetState.vehicles.length}</strong>
-          <p>Unified fleet telemetry across the city.</p>
+          <strong>{liveVehicles.length}</strong>
+          <p>Tenant-aware telemetry and role-gated operations.</p>
         </article>
         <article className="stat-card accent-amber">
           <span>Low battery alerts</span>
-          <strong>{lowBatteryVehicles.length}</strong>
-          <p>Automatic intervention at 20% SoC.</p>
+          <strong>{alerts.filter((alert) => alert.vehicleId).length}</strong>
+          <p>Auto rerouting triggers below the recovery threshold.</p>
         </article>
         <article className="stat-card accent-lime">
           <span>Emissions saved</span>
           <strong>{formatNumber(carbonMetrics.emissionsSavedKg, 1)} kg</strong>
-          <p>{formatNumber(carbonMetrics.emissionsSavedPercent, 0)}% below diesel baseline.</p>
+          <p>{formatNumber(emissionsTrend, 1)} kg trend across the selected window.</p>
         </article>
         <article className="stat-card accent-rose">
-          <span>Cost avoided</span>
-          <strong>{formatCurrency(carbonMetrics.costSaved)}</strong>
-          <p>Electric miles beat fuel spend and idle time.</p>
+          <span>On-time delivery</span>
+          <strong>{formatNumber(visibleHistory.at(-1)?.onTimeRate ?? 0, 0)}%</strong>
+          <p>{onTimeTrend >= 0 ? "+" : ""}{formatNumber(onTimeTrend, 1)} pts versus window start.</p>
         </article>
       </section>
 
@@ -203,17 +738,17 @@ export default function Home() {
           <div className="panel-heading">
             <div>
               <p className="panel-label">EV fleet management</p>
-              <h2>Active vehicles</h2>
+              <h2>Vehicles + route health</h2>
             </div>
-            <span className="badge">50 packages on deck</span>
+            <span className="badge">{routeList.length} active routes</span>
           </div>
 
           <div className="vehicle-list">
-            {fleetState.vehicles.map((vehicle) => (
+            {filteredVehicles.map((vehicle) => (
               <button
                 key={vehicle.id}
                 type="button"
-                className={`vehicle-row ${selectedVehicle.id === vehicle.id ? "vehicle-row-selected" : ""}`}
+                className={`vehicle-row ${selectedVehicle?.id === vehicle.id ? "vehicle-row-selected" : ""}`}
                 onClick={() => setSelectedVehicleId(vehicle.id)}
               >
                 <div className="vehicle-row-top">
@@ -229,12 +764,22 @@ export default function Home() {
                     <span>State of charge</span>
                     <strong>{formatNumber(vehicle.batterySoc, 0)}%</strong>
                   </div>
-                  <MeterBar value={vehicle.batterySoc} tone="battery" />
+                  <MeterBar value={vehicle.batterySoc} tone={vehicle.batterySoc <= 25 ? "warning" : "battery"} />
+                </div>
+
+                <div className="progress-block">
+                  <div className="progress-label">
+                    <span>Battery health</span>
+                    <strong>{formatNumber(vehicle.batteryHealth, 0)}%</strong>
+                  </div>
+                  <MeterBar value={vehicle.batteryHealth} tone="grid" />
                 </div>
 
                 <div className="vehicle-row-meta">
-                  <span>{vehicle.packagesDelivered}/{vehicle.assignedPackages} deliveries</span>
-                  <span>{formatNumber(vehicle.mileage, 1)} mi</span>
+                  <span>
+                    {vehicle.packagesDelivered}/{vehicle.assignedPackages} deliveries
+                  </span>
+                  <span>{formatNumber(vehicle.etaMinutes, 0)} min ETA</span>
                 </div>
               </button>
             ))}
@@ -244,84 +789,109 @@ export default function Home() {
         <div className="panel map-panel">
           <div className="panel-heading">
             <div>
-              <p className="panel-label">Live monitoring</p>
-              <h2>Map + station interception</h2>
+              <p className="panel-label">Map playback + station planning</p>
+              <h2>Live monitoring</h2>
             </div>
-            <span className="badge badge-strong">Detour logic active</span>
+            <span className="badge badge-strong">{playbackMode ? "Playback mode" : "Live mode"}</span>
+          </div>
+
+          <div className="timeline-toolbar">
+            <button type="button" className="secondary-button" onClick={() => setPlaybackMode((current) => !current)}>
+              {playbackMode ? "Use live feed" : "Open playback"}
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setTimelinePlaying((current) => !current)}
+              disabled={!playbackMode}
+            >
+              {timelinePlaying ? "Pause timeline" : "Play timeline"}
+            </button>
+            <label className="timeline-range">
+              <span>{playbackFrame ? `${playbackFrame.label} · ${formatDateTime(playbackFrame.timestamp)}` : "Current state"}</span>
+              <input
+                type="range"
+                min="0"
+                max={Math.max(0, activeDashboard.playbackFrames.length - 1)}
+                value={timelineIndex}
+                onChange={(event) => setTimelineIndex(Number(event.target.value))}
+                disabled={!playbackMode}
+              />
+            </label>
           </div>
 
           <div className="map-frame">
-            <svg className="map-svg" viewBox="0 0 100 100" role="img" aria-label="EcoFleet city map">
-              <g transform={focusTransform}>
-                {Array.from({ length: 11 }, (_, index) => (
-                  <line key={`v-${index}`} className="map-grid-line" x1={index * 10} y1="0" x2={index * 10} y2="100" />
-                ))}
-                {Array.from({ length: 11 }, (_, index) => (
-                  <line key={`h-${index}`} className="map-grid-line" x1="0" y1={index * 10} x2="100" y2={index * 10} />
-                ))}
-                <circle className="map-glow map-glow-one" cx="20" cy="12" r="11" />
-                <circle className="map-glow map-glow-two" cx="82" cy="76" r="13" />
+            <svg className="map-svg" viewBox="0 0 100 100" role="img" aria-label="Fleet and station map">
+              {Array.from({ length: 11 }, (_, index) => (
+                <line key={`v-${index}`} className="map-grid-line" x1={index * 10} y1="0" x2={index * 10} y2="100" />
+              ))}
+              {Array.from({ length: 11 }, (_, index) => (
+                <line key={`h-${index}`} className="map-grid-line" x1="0" y1={index * 10} x2="100" y2={index * 10} />
+              ))}
 
-                {fleetState.stations.map((station) => {
-                  const isCompatible = station.id === focusStation?.id;
+              {plannedStations.map((station) => {
+                const isFocused = station.id === focusStation?.id;
 
-                  return (
-                    <g
-                      key={station.id}
-                      className={`map-station ${station.type === "swap" ? "map-station-swap" : "map-station-fast"} ${
-                        isCompatible ? "map-station-highlight" : ""
-                      }`}
-                      onClick={() => setSelectedVehicleId(selectedVehicle.id)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      <circle cx={station.x} cy={station.y} r="3.4" />
-                      <circle cx={station.x} cy={station.y} r="5.9" className="map-station-ring" />
-                      <text x={station.x} y={station.y + 1.1} textAnchor="middle" className="map-station-label">
-                        {station.type === "swap" ? "SWP" : "CHG"}
-                      </text>
-                    </g>
-                  );
-                })}
+                return (
+                  <g
+                    key={station.id}
+                    className={`map-station ${station.type === "swap" ? "map-station-swap" : "map-station-fast"} ${
+                      isFocused ? "map-station-highlight" : ""
+                    }`}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${station.name}, ${station.waitTimeMinutes} minute wait`}
+                    onClick={() => setShowScenario((current) => current)}
+                    onKeyDown={(event) => handleActionKey(event, () => setShowScenario((current) => current))}
+                  >
+                    <circle cx={station.x} cy={station.y} r="3.4" />
+                    <circle cx={station.x} cy={station.y} r="5.8" className="map-station-ring" />
+                    <text x={station.x} y={station.y + 1.1} textAnchor="middle" className="map-station-label">
+                      {station.type === "swap" ? "SWP" : "CHG"}
+                    </text>
+                  </g>
+                );
+              })}
 
-                {fleetState.vehicles.map((vehicle) => {
-                  const isSelected = vehicle.id === selectedVehicle.id;
-                  const recoveryStation = vehicle.recoveryStationId
-                    ? fleetState.stations.find((station) => station.id === vehicle.recoveryStationId) ?? null
-                    : null;
+              {displayVehicles.map((vehicle) => {
+                const isSelected = vehicle.id === selectedVehicle?.id;
+                const recoveryStation = vehicle.recoveryStationId
+                  ? plannedStations.find((station) => station.id === vehicle.recoveryStationId) ?? null
+                  : null;
 
-                  return (
-                    <g
-                      key={vehicle.id}
-                      className={`map-vehicle ${isSelected ? "map-vehicle-selected" : ""}`}
-                      onClick={() => setSelectedVehicleId(vehicle.id)}
-                      role="button"
-                      tabIndex={0}
-                    >
-                      {recoveryStation ? <circle cx={vehicle.x} cy={vehicle.y} r="5.6" className="map-vehicle-ring" /> : null}
-                      <circle cx={vehicle.x} cy={vehicle.y} r="3.8" className="map-vehicle-core" />
-                      <text x={vehicle.x} y={vehicle.y - 6} textAnchor="middle" className="map-vehicle-label">
-                        {formatNumber(vehicle.batterySoc, 0)}%
-                      </text>
-                    </g>
-                  );
-                })}
-              </g>
+                return (
+                  <g
+                    key={vehicle.id}
+                    className={`map-vehicle ${isSelected ? "map-vehicle-selected" : ""}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-label={`${vehicle.name}, battery ${formatNumber(vehicle.batterySoc, 0)} percent`}
+                    onClick={() => setSelectedVehicleId(vehicle.id)}
+                    onKeyDown={(event) => handleActionKey(event, () => setSelectedVehicleId(vehicle.id))}
+                  >
+                    {recoveryStation ? <circle cx={vehicle.x} cy={vehicle.y} r="5.5" className="map-vehicle-ring" /> : null}
+                    <circle cx={vehicle.x} cy={vehicle.y} r="3.8" className="map-vehicle-core" />
+                    <text x={vehicle.x} y={vehicle.y - 6} textAnchor="middle" className="map-vehicle-label">
+                      {formatNumber(vehicle.batterySoc, 0)}%
+                    </text>
+                  </g>
+                );
+              })}
             </svg>
           </div>
 
           <div className="map-footer">
             <div>
               <span>Focused vehicle</span>
-              <strong>{selectedVehicle.name}</strong>
+              <strong>{selectedVehicle?.name ?? "No vehicle selected"}</strong>
             </div>
             <div>
               <span>Nearest compatible station</span>
               <strong>{focusStation?.name ?? "No station available"}</strong>
             </div>
             <div>
-              <span>Route status</span>
-              <strong>{selectedVehicle.status}</strong>
+              <span>Playback emissions</span>
+              <strong>{formatNumber(playbackMetrics.emissionsSavedKg, 1)} kg saved</strong>
             </div>
           </div>
         </div>
@@ -329,75 +899,150 @@ export default function Home() {
         <div className="panel insights-panel">
           <div className="panel-heading">
             <div>
-              <p className="panel-label">Carbon footprint calculator</p>
-              <h2>ESG proof for clients</h2>
+              <p className="panel-label">Dispatch intelligence + ESG analytics</p>
+              <h2>Decision support</h2>
             </div>
-            <span className="badge">CO2 savings dashboard</span>
+            <span className="badge">{dateRange} window</span>
           </div>
 
-          <div className="carbon-summary">
-            <div className="metric-stack">
-              <div>
-                <span>Total miles</span>
-                <strong>{formatNumber(carbonMetrics.totalMiles, 1)}</strong>
-              </div>
-              <div>
-                <span>EV energy</span>
-                <strong>{formatNumber(carbonMetrics.totalEnergyKwh, 1)} kWh</strong>
-              </div>
+          <div className="metric-stack">
+            <div>
+              <span>Total miles</span>
+              <strong>{formatNumber(carbonMetrics.totalMiles, 1)}</strong>
             </div>
-            <div className="metric-stack">
-              <div>
-                <span>Diesel baseline</span>
-                <strong>{formatNumber(carbonMetrics.dieselEmissionsKg, 1)} kg CO2</strong>
-              </div>
-              <div>
-                <span>Grid footprint</span>
-                <strong>{formatNumber(carbonMetrics.gridEmissionsKg, 1)} kg CO2</strong>
-              </div>
+            <div>
+              <span>Cost saved</span>
+              <strong>{formatCurrency(carbonMetrics.costSaved)}</strong>
+            </div>
+            <div>
+              <span>Grid footprint</span>
+              <strong>{formatNumber(carbonMetrics.gridEmissionsKg, 1)} kg</strong>
+            </div>
+            <div>
+              <span>Diesel baseline</span>
+              <strong>{formatNumber(carbonMetrics.dieselEmissionsKg, 1)} kg</strong>
             </div>
           </div>
 
           <div className="chart-card">
             <div className="chart-header">
-              <span>Comparison</span>
-              <strong>{formatNumber(carbonMetrics.emissionsSavedKg, 1)} kg saved</strong>
+              <span>Baseline comparison</span>
+              <strong>{formatNumber(carbonMetrics.emissionsSavedPercent, 0)}% below diesel</strong>
             </div>
-            <div className="chart-bars">
-              {emissionBars.map((bar) => {
-                const value =
-                  bar.valueKey === "diesel"
-                    ? carbonMetrics.dieselEmissionsKg
-                    : bar.valueKey === "grid"
-                      ? carbonMetrics.gridEmissionsKg
-                      : carbonMetrics.emissionsSavedKg;
-                return (
-                  <div key={bar.label} className="bar-row">
-                    <span>{bar.label}</span>
-                    <MeterBar value={(value / emissionChartMax) * 100} tone={bar.valueKey} />
-                    <strong>{formatNumber(value, 1)}</strong>
-                  </div>
-                );
-              })}
+            <div className="bar-row">
+              <span>Diesel</span>
+              <MeterBar value={100} tone="diesel" />
+              <strong>{formatNumber(carbonMetrics.dieselEmissionsKg, 1)}</strong>
+            </div>
+            <div className="bar-row">
+              <span>Grid</span>
+              <MeterBar value={(carbonMetrics.gridEmissionsKg / Math.max(1, carbonMetrics.dieselEmissionsKg)) * 100} tone="grid" />
+              <strong>{formatNumber(carbonMetrics.gridEmissionsKg, 1)}</strong>
+            </div>
+            <div className="bar-row">
+              <span>Saved</span>
+              <MeterBar value={(carbonMetrics.emissionsSavedKg / Math.max(1, carbonMetrics.dieselEmissionsKg)) * 100} tone="saved" />
+              <strong>{formatNumber(carbonMetrics.emissionsSavedKg, 1)}</strong>
             </div>
           </div>
 
           <div className="dispatch-card">
             <div className="dispatch-header">
-              <span>Route optimization</span>
-              <strong>Best-fit assignments by battery health</strong>
+              <span>Auto-reassignment</span>
+              <strong>Traffic, battery, and wait-aware route recommendations</strong>
             </div>
             <div className="dispatch-list">
-              {topDispatches.map((vehicle, index) => (
-                <div key={vehicle.id} className="dispatch-row">
+              {dispatchPlan.map((item) => (
+                <div key={item.routeId} className="dispatch-row">
                   <div>
-                    <strong>{index + 1}. {vehicle.name}</strong>
-                    <span>{vehicle.assignedPackages} packages</span>
+                    <strong>{item.routeName}</strong>
+                    <span>
+                      {item.currentVehicleName} → {item.recommendedVehicleName}
+                    </span>
                   </div>
-                  <strong>{formatNumber(vehicle.batterySoc, 0)}%</strong>
+                  <strong>{formatNumber(item.score, 0)}</strong>
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+
+        <div className="panel table-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Per-vehicle ESG proof</p>
+              <h2>Vehicle breakdown</h2>
+            </div>
+            <span className="badge">{vehicleBreakdown.length} assets</span>
+          </div>
+          <div className="table-list">
+            {vehicleBreakdown.map((vehicle) => (
+              <div key={vehicle.id} className="table-row">
+                <div>
+                  <strong>{vehicle.name}</strong>
+                  <span>{formatNumber(vehicle.gridFootprintKg, 1)} kg grid CO2</span>
+                </div>
+                <div>
+                  <strong>{formatNumber(vehicle.emissionsSavedKg, 1)} kg</strong>
+                  <span>{formatCurrency(vehicle.costSaved)}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel table-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Per-route analytics</p>
+              <h2>Route breakdown</h2>
+            </div>
+            <span className="badge">{routeBreakdown.length} lanes</span>
+          </div>
+          <div className="table-list">
+            {routeBreakdown.map((route) => (
+              <div key={route.id} className="table-row">
+                <div>
+                  <strong>{route.name}</strong>
+                  <span>{route.priority} priority</span>
+                </div>
+                <div>
+                  <strong>{formatNumber(route.emissionsSavedKg, 1)} kg</strong>
+                  <span>{formatNumber(route.delayMinutes, 0)} min delay</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="panel table-panel">
+          <div className="panel-heading">
+            <div>
+              <p className="panel-label">Station operations</p>
+              <h2>Queue + SLA view</h2>
+            </div>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => setShowScenario((current) => !current)}
+              disabled={!permissions.canPlan}
+            >
+              {showScenario ? "Hide what-if station" : "Enable what-if station"}
+            </button>
+          </div>
+          <div className="table-list">
+            {stationMetrics.map((station) => (
+              <div key={station.id} className="table-row">
+                <div>
+                  <strong>{station.name}</strong>
+                  <span>{station.queueLength} vehicles queued</span>
+                </div>
+                <div>
+                  <strong>{formatNumber(station.waitTimeMinutes, 0)} min</strong>
+                  <span>{station.utilizationPercent}% util · {station.slaRisk}</span>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       </section>

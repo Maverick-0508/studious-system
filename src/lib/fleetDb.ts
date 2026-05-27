@@ -5,22 +5,42 @@ import type { DashboardPreset, FleetDatabase } from "@/lib/fleetTypes";
 
 const dataDirectory = path.join(process.cwd(), "data");
 const dataFile = path.join(dataDirectory, "fleet-db.json");
+let inMemoryDatabase: FleetDatabase | null = null;
 
 async function ensureDatabase(): Promise<FleetDatabase> {
+  if (inMemoryDatabase) {
+    return inMemoryDatabase;
+  }
+
   try {
     const fileContents = await readFile(dataFile, "utf8");
-    return JSON.parse(fileContents) as FleetDatabase;
+    const database = JSON.parse(fileContents) as FleetDatabase;
+    inMemoryDatabase = database;
+    return database;
   } catch {
     const seed = buildSeedDatabase();
-    await mkdir(dataDirectory, { recursive: true });
-    await writeFile(dataFile, JSON.stringify(seed, null, 2));
+    inMemoryDatabase = seed;
+
+    try {
+      await mkdir(dataDirectory, { recursive: true });
+      await writeFile(dataFile, JSON.stringify(seed, null, 2));
+    } catch {
+      // Ignore persistence errors (e.g. read-only serverless filesystem).
+    }
+
     return seed;
   }
 }
 
 async function persistDatabase(database: FleetDatabase): Promise<void> {
-  await mkdir(dataDirectory, { recursive: true });
-  await writeFile(dataFile, JSON.stringify(database, null, 2));
+  inMemoryDatabase = database;
+
+  try {
+    await mkdir(dataDirectory, { recursive: true });
+    await writeFile(dataFile, JSON.stringify(database, null, 2));
+  } catch {
+    // Ignore persistence errors (e.g. read-only serverless filesystem).
+  }
 }
 
 export async function getFleetDatabase(): Promise<FleetDatabase> {
